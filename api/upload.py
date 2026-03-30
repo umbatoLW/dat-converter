@@ -1,12 +1,14 @@
-from fastapi import FastAPI, HTTPException
-import os
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from typing import Dict, Any
 import json
+import os
 
+# FastAPI应用实例
 app = FastAPI()
 
 # 获取环境变量
-SUPABASE_URL = os.getenv("SUPABASE_URL", "您的Supabase项目URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "您的Supabase匿名密钥")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
 @app.get("/")
 async def root():
@@ -27,3 +29,7 @@ async def upload_file():
         "file_id": "test-123",
         "download_url": "https://example.com/test"
     }
+
+# 必须导出app实例
+# 重要：这行必须存在，Vercel才能识别为无服务器函数
+app = app
