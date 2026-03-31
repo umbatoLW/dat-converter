@@ -1,368 +1,253 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-DAT转换API - 处理扣子平台的文件转换请求
-部署在Vercel的无服务器函数
-"""
-
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Optional, Dict, Any
 import requests
 import zipfile
+import tempfile
+import os
 import io
 import base64
-import os
-import uuid
-from datetime import datetime, timedelta
-import tempfile
-from typing import List, Dict, Any, Optional
 import json
+import time
 
 # 创建FastAPI应用
-app = FastAPI(title="DAT转换API", version="1.0.0")
+app = FastAPI(title="DAT转换API")
 
-# 从环境变量获取Supabase配置
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
-SUPABASE_BUCKET = "dat-conversions"  # Supabase存储桶名称
+# 添加CORS中间件
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # 请求模型
 class UploadRequest(BaseModel):
-    zip_url: Optional[str] = None
-    zip_base64: Optional[str] = None
-    filename: Optional[str] = None
+    zip_url: str
+    filename: Optional[str] = "converted_images.zip"
+
+# 响应模型
+class UploadResponse(BaseModel):
+    success: bool
+    message: str
+    download_url: Optional[str] = None
+    file_id: Optional[str] = None
     stats: Optional[Dict[str, Any]] = None
 
-class FileInfo(BaseModel):
-    name: str
-    content_base64: str
-    file_type: str
-
-@app.get("/")
-async def root():
-    """根端点，健康检查"""
-    return {
-        "service": "DAT转换API",
-        "status": "running",
-        "version": "1.0.0",
-        "endpoints": {
-            "test": "/test",
-            "upload": "/upload (POST)",
-            "download": "/download/{file_id} (GET)"
-        }
-    }
-
-@app.get("/test")
-async def test():
-    """测试端点，检查环境变量"""
-    return {
-        "status": "running",
-        "supabase_configured": bool(SUPABASE_URL and SUPABASE_KEY),
-        "supabase_url_short": SUPABASE_URL[:20] + "..." if SUPABASE_URL else "未设置"
-    }
-
-def detect_image_format_and_key(dat_content: bytes) -> tuple:
-    """
-    检测DAT文件的图片格式和解密密钥
-    返回: (格式, 密钥) 或 (None, None)
-    """
-    # 支持的图片格式及其文件头
+def detect_image_format_and_key(dat_content: bytes):
+    """检测图片格式和密钥"""
+    if len(dat_content) < 8:
+        return None, None
+    
     formats = [
-        ('jpg', b'\xFF\xD8\xFF', 3),      # JPEG
-        ('png', b'\x89PNG\r\n\x1a\n', 8), # PNG
-        ('gif', b'GIF87a', 6),           # GIF
-        ('gif', b'GIF89a', 6),           # GIF
-        ('bmp', b'BM', 2),               # BMP
+        ('jpg', b'\xFF\xD8\xFF', 3),
+        ('png', b'\x89PNG\r\n\x1a\n', 8),
+        ('gif', b'GIF87a', 6),
+        ('gif', b'GIF89a', 6),
+        ('bmp', b'BM', 2),
     ]
     
     for ext, header, header_len in formats:
         if len(dat_content) >= header_len:
-            # 尝试找出正确的密钥
-            test_key = dat_content[0] ^ header[0]
-            decrypted = bytes([b ^ test_key for b in dat_content[:header_len]])
+            key = dat_content[0] ^ header[0]
+            decrypted = bytes([b ^ key for b in dat_content[:header_len]])
             if decrypted == header:
-                return ext, test_key
+                return ext, key
+    
     return None, None
 
-def process_dat_conversion(zip_content: bytes) -> Dict[str, Any]:
-    """
-    处理ZIP文件中的DAT转换
-    返回转换结果
-    """
+def decrypt_dat_file(data: bytes, key: int) -> bytes:
+    """解密DAT文件"""
+    return bytes([b ^ key for b in data])
+
+def process_zip_file(zip_content: bytes) -> Dict[str, Any]:
+    """处理ZIP文件中的DAT转换"""
     try:
-        # 创建临时目录
         with tempfile.TemporaryDirectory() as temp_dir:
-            # 保存ZIP到临时文件
+            # 保存ZIP文件
             zip_path = os.path.join(temp_dir, "input.zip")
             with open(zip_path, 'wb') as f:
                 f.write(zip_content)
             
-            # 处理ZIP文件
-            converted_files = []
-            total_files = 0
-            converted_count = 0
-            failed_count = 0
-            
+            # 打开ZIP文件
             with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                # 获取所有文件
                 all_files = zip_ref.namelist()
                 
+                # 统计信息
+                stats = {
+                    "total_files": len(all_files),
+                    "dat_files": 0,
+                    "converted": 0,
+                    "failed": 0,
+                    "failed_files": []
+                }
+                
+                # 创建输出目录
+                output_dir = os.path.join(temp_dir, "output")
+                os.makedirs(output_dir, exist_ok=True)
+                
+                # 处理每个文件
                 for file_path in all_files:
                     if file_path.lower().endswith('.dat'):
-                        total_files += 1
+                        stats["dat_files"] += 1
+                        
                         try:
                             # 提取DAT文件
                             zip_ref.extract(file_path, temp_dir)
-                            dat_file_path = os.path.join(temp_dir, file_path)
+                            dat_path = os.path.join(temp_dir, file_path)
                             
                             # 读取DAT文件
-                            with open(dat_file_path, 'rb') as f:
+                            with open(dat_path, 'rb') as f:
                                 dat_content = f.read()
                             
-                            # 检测格式和解密
+                            # 检测格式和密钥
                             image_format, key = detect_image_format_and_key(dat_content)
                             
                             if image_format and key is not None:
                                 # 解密数据
-                                decrypted_data = bytes([b ^ key for b in dat_content])
+                                decrypted_data = decrypt_dat_file(dat_content, key)
                                 
-                                # 验证解密后的数据
+                                # 验证是否是JPG
                                 if image_format == 'jpg' and decrypted_data.startswith(b'\xFF\xD8\xFF'):
-                                    # 准备文件信息
-                                    file_name = os.path.splitext(os.path.basename(file_path))[0] + f".{image_format}"
-                                    file_content_base64 = base64.b64encode(decrypted_data).decode('utf-8')
+                                    # 生成输出文件名
+                                    base_name = os.path.basename(file_path)
+                                    name_without_ext = os.path.splitext(base_name)[0]
+                                    output_file = f"{name_without_ext}.jpg"
+                                    output_path = os.path.join(output_dir, output_file)
                                     
-                                    converted_files.append({
-                                        "name": file_name,
-                                        "content_base64": file_content_base64,
-                                        "file_type": image_format
-                                    })
-                                    converted_count += 1
+                                    # 保存文件
+                                    with open(output_path, 'wb') as f:
+                                        f.write(decrypted_data)
+                                    
+                                    stats["converted"] += 1
                                 else:
-                                    failed_count += 1
+                                    stats["failed"] += 1
+                                    stats["failed_files"].append(file_path)
                             else:
-                                failed_count += 1
+                                stats["failed"] += 1
+                                stats["failed_files"].append(file_path)
                             
                             # 清理临时文件
                             try:
-                                os.remove(dat_file_path)
+                                os.remove(dat_path)
                             except:
                                 pass
                                 
                         except Exception as e:
-                            failed_count += 1
-                            print(f"处理文件 {file_path} 失败: {str(e)}")
-            
-            # 创建结果ZIP文件
-            zip_buffer = io.BytesIO()
-            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                for file_info in converted_files:
-                    file_content = base64.b64decode(file_info["content_base64"])
-                    zipf.writestr(file_info["name"], file_content)
-            
-            zip_buffer.seek(0)
-            zip_data = zip_buffer.read()
-            zip_base64 = base64.b64encode(zip_data).decode('utf-8')
-            
-            return {
-                "success": True,
-                "message": f"转换完成，共{total_files}个DAT文件，成功{converted_count}个，失败{failed_count}个",
-                "zip_base64": zip_base64,
-                "converted_count": converted_count,
-                "failed_count": failed_count,
-                "total_files": total_files
-            }
-            
+                            stats["failed"] += 1
+                            stats["failed_files"].append(file_path)
+                
+                # 如果转换成功，创建输出ZIP
+                if stats["converted"] > 0:
+                    # 获取所有输出文件
+                    output_files = []
+                    for root, dirs, files in os.walk(output_dir):
+                        for file in files:
+                            if file.lower().endswith('.jpg'):
+                                output_files.append(os.path.join(root, file))
+                    
+                    if output_files:
+                        # 创建ZIP文件
+                        zip_buffer = io.BytesIO()
+                        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                            for file_path in output_files:
+                                zipf.write(file_path, os.path.basename(file_path))
+                        
+                        zip_buffer.seek(0)
+                        zip_data = zip_buffer.getvalue()
+                        zip_base64 = base64.b64encode(zip_data).decode('utf-8')
+                        
+                        return {
+                            "success": True,
+                            "message": f"转换完成: 共{stats['dat_files']}个DAT文件，成功{stats['converted']}个，失败{stats['failed']}个",
+                            "zip_base64": zip_base64,
+                            "stats": stats
+                        }
+                
+                return {
+                    "success": False,
+                    "message": f"没有成功转换任何文件。找到{stats['dat_files']}个DAT文件，全部转换失败。",
+                    "zip_base64": None,
+                    "stats": stats
+                }
+                
     except Exception as e:
         return {
             "success": False,
-            "message": f"处理失败: {str(e)}",
-            "zip_base64": "",
-            "converted_count": 0,
-            "failed_count": 0,
-            "total_files": 0
+            "message": f"处理ZIP文件时出错: {str(e)}",
+            "zip_base64": None,
+            "stats": None
         }
 
-def upload_to_supabase(zip_data: bytes, filename: str) -> Optional[str]:
-    """
-    上传ZIP文件到Supabase存储
-    返回: 文件ID 或 None
-    """
-    try:
-        if not SUPABASE_URL or not SUPABASE_KEY:
-            print("Supabase配置未设置，跳过上传")
-            return None
-        
-        # 生成唯一文件名
-        file_id = str(uuid.uuid4())
-        file_extension = os.path.splitext(filename)[1] or ".zip"
-        supabase_filename = f"{file_id}{file_extension}"
-        
-        # 这里需要根据实际的Supabase SDK进行调整
-        # 假设使用Supabase Python客户端
-        from supabase import create_client, Client
-        
-        supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        
-        # 上传文件
-        result = supabase.storage.from_(SUPABASE_BUCKET).upload(
-            supabase_filename,
-            zip_data,
-            {"content-type": "application/zip"}
-        )
-        
-        if result:
-            return file_id
-        else:
-            return None
-            
-    except Exception as e:
-        print(f"上传到Supabase失败: {e}")
-        return None
+@app.get("/")
+async def root():
+    return {"message": "DAT转换API服务运行中", "status": "ok"}
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "timestamp": time.time()}
 
 @app.post("/upload")
 async def upload_file(request: UploadRequest):
     """
-    接收扣子平台的ZIP文件（URL或base64），转换DAT文件，返回下载链接
+    接收ZIP文件的URL，处理并返回转换结果
     """
     try:
-        # 检查输入
-        if not request.zip_url and not request.zip_base64:
-            raise HTTPException(
-                status_code=400,
-                detail="请提供zip_url或zip_base64参数"
-            )
+        # 1. 验证输入
+        if not request.zip_url:
+            raise HTTPException(status_code=400, detail="缺少zip_url参数")
         
-        zip_content = None
+        if not request.zip_url.startswith(('http://', 'https://')):
+            raise HTTPException(status_code=400, detail="zip_url必须是有效的HTTP/HTTPS链接")
         
-        # 从URL获取ZIP文件
-        if request.zip_url:
-            try:
-                response = requests.get(request.zip_url, timeout=30)
-                response.raise_for_status()
-                zip_content = response.content
-            except Exception as e:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"无法从URL下载ZIP文件: {str(e)}"
-                )
-        
-        # 从base64获取ZIP文件
-        elif request.zip_base64:
-            try:
-                zip_content = base64.b64decode(request.zip_base64)
-            except Exception as e:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"base64解码失败: {str(e)}"
-                )
-        
-        if not zip_content or len(zip_content) == 0:
-            raise HTTPException(
-                status_code=400,
-                detail="ZIP文件内容为空"
-            )
-        
-        # 处理DAT转换
-        conversion_result = process_dat_conversion(zip_content)
-        
-        if not conversion_result["success"]:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "success": False,
-                    "message": conversion_result["message"],
-                    "download_url": ""
-                }
-            )
-        
-        # 如果配置了Supabase，则上传
-        file_id = None
-        download_url = ""
-        
-        if SUPABASE_URL and SUPABASE_KEY:
-            zip_data = base64.b64decode(conversion_result["zip_base64"])
-            file_id = upload_to_supabase(zip_data, request.filename or f"converted_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip")
-            
-            if file_id:
-                download_url = f"https://dat-converter.vercel.app/api/download/{file_id}"
-        
-        # 如果没有Supabase，或者上传失败，则直接返回base64
-        if not download_url:
-            download_url = f"data:application/zip;base64,{conversion_result['zip_base64'][:1000]}..."
-            if len(conversion_result['zip_base64']) > 1000:
-                download_url += f" (前1000字符，完整数据{len(conversion_result['zip_base64'])}字符)"
-        
-        return {
-            "success": True,
-            "message": conversion_result["message"],
-            "file_id": file_id or "not_stored",
-            "download_url": download_url,
-            "direct_download": bool(file_id),  # 是否有直接的下载链接
-            "converted_count": conversion_result["converted_count"],
-            "failed_count": conversion_result["failed_count"],
-            "total_files": conversion_result["total_files"],
-            "zip_size": len(zip_content),
-            "result_size": len(conversion_result["zip_base64"])
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"处理请求时发生错误: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"服务器内部错误: {str(e)}"
-        )
-
-@app.get("/download/{file_id}")
-async def download_file(file_id: str):
-    """
-    从Supabase下载文件
-    """
-    try:
-        if not SUPABASE_URL or not SUPABASE_KEY:
-            raise HTTPException(
-                status_code=500,
-                detail="文件存储服务未配置"
-            )
-        
-        from supabase import create_client, Client
-        supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        
-        # 尝试从Supabase获取文件
+        # 2. 下载ZIP文件
         try:
-            # 这里需要根据实际的Supabase存储结构调整
-            file_data = supabase.storage.from_(SUPABASE_BUCKET).download(f"{file_id}.zip")
-            
-            if not file_data:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"文件 {file_id} 不存在"
-                )
-            
-            return {
-                "success": True,
-                "file_id": file_id,
-                "content_type": "application/zip",
-                "content": base64.b64encode(file_data).decode('utf-8')
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             }
+            response = requests.get(request.zip_url, headers=headers, timeout=30)
+            response.raise_for_status()
+            zip_content = response.content
             
-        except Exception as e:
-            raise HTTPException(
-                status_code=404,
-                detail=f"文件不存在或已过期: {str(e)}"
+            if len(zip_content) == 0:
+                raise HTTPException(status_code=400, detail="下载的ZIP文件为空")
+                
+        except requests.exceptions.RequestException as e:
+            raise HTTPException(status_code=400, detail=f"下载ZIP文件失败: {str(e)}")
+        
+        # 3. 处理DAT转换
+        result = process_zip_file(zip_content)
+        
+        if not result["success"]:
+            return UploadResponse(
+                success=False,
+                message=result["message"],
+                stats=result["stats"]
             )
-            
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"下载文件时出错: {str(e)}"
+        
+        # 4. 返回base64编码的ZIP文件
+        # 注意：这里我们直接返回base64，实际使用中可以考虑上传到云存储
+        zip_base64 = result["zip_base64"]
+        file_id = f"converted_{int(time.time())}_{hash(zip_base64[:100])}"
+        
+        # 生成data URL，可以直接在浏览器中下载
+        download_url = f"data:application/zip;base64,{zip_base64}"
+        
+        return UploadResponse(
+            success=True,
+            message=result["message"],
+            download_url=download_url,
+            file_id=file_id,
+            stats=result["stats"]
         )
+        
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"服务器内部错误: {str(e)}")
 
-# 这是Vercel要求的导出格式
-# 必须命名为'app'，Vercel会自动识别
+# Vercel需要这个导出
 app = app
