@@ -1,67 +1,73 @@
 @app.post("/upload")
 async def upload_file(request_data: dict):
     """
-    接收base64编码的ZIP文件，存储到Supabase，返回下载链接
+    接收扣子平台传来的ZIP URL，下载、转换并返回结果
     """
     try:
+        import requests
+        import zipfile
+        import io
         import base64
-        from datetime import datetime, timedelta
-        import uuid
+        from datetime import datetime
         
-        # 从请求中获取数据
-        zip_base64 = request_data.get("zip_base64", "")
-        filename = request_data.get("filename", f"converted_{uuid.uuid4().hex[:8]}.zip")
-        stats = request_data.get("stats", {})
+        # 获取参数
+        zip_url = request_data.get("zip_url")
+        filename = request_data.get("filename", f"converted_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip")
         
-        if not zip_base64:
+        if not zip_url:
             return {
                 "success": False,
-                "message": "未收到ZIP文件数据",
+                "message": "未收到ZIP文件URL",
                 "download_url": ""
             }
         
-        # 解码base64
-        zip_data = base64.b64decode(zip_base64)
+        # 1. 从扣子平台下载ZIP文件
+        response = requests.get(zip_url, stream=True)
+        if response.status_code != 200:
+            return {
+                "success": False,
+                "message": f"下载ZIP文件失败: {response.status_code}",
+                "download_url": ""
+            }
         
-        # 上传到Supabase存储
-        file_id = str(uuid.uuid4())
-        zip_filename = f"{file_id}.zip"
+        # 2. 处理DAT文件转换
+        conversion_result = process_dat_conversion(response.content)
         
-        # 这里使用您的Supabase客户端上传文件
-        # upload_result = supabase.storage.from_("dat-conversions").upload(
-        #     zip_filename,
-        #     zip_data,
-        #     {"content-type": "application/zip"}
-        # )
+        if not conversion_result["success"]:
+            return {
+                "success": False,
+                "message": conversion_result["message"],
+                "download_url": ""
+            }
         
-        # 假设上传成功，获取文件URL
-        file_url = f"{SUPABASE_URL}/storage/v1/object/public/dat-conversions/{zip_filename}"
+        # 3. 上传到Supabase存储
+        file_id = upload_to_supabase(
+            conversion_result["zip_data"],
+            filename
+        )
         
-        # 创建数据库记录
-        expires_at = datetime.utcnow() + timedelta(hours=24)
+        if not file_id:
+            return {
+                "success": False,
+                "message": "文件上传失败",
+                "download_url": ""
+            }
         
-        # 这里插入数据库记录
-        # supabase.table("file_records").insert({
-        #     "id": file_id,
-        #     "file_name": zip_filename,
-        #     "file_url": file_url,
-        #     "expires_at": expires_at.isoformat() + "Z"
-        # }).execute()
+        # 4. 返回下载链接
+        download_url = f"https://dat-converter.vercel.app/download/{file_id}"
         
-        # 返回结果
         return {
             "success": True,
-            "message": f"文件上传成功，共{stats.get('converted_count', 0)}个图片",
+            "message": conversion_result["message"],
+            "download_url": download_url,
             "file_id": file_id,
-            "download_url": f"https://dat-converter.vercel.app/download/{file_id}",
-            "direct_url": file_url,
-            "expires_at": expires_at.isoformat(),
-            "stats": stats
+            "converted_count": conversion_result["converted_count"],
+            "failed_count": conversion_result["failed_count"]
         }
         
     except Exception as e:
         return {
             "success": False,
-            "message": f"上传失败: {str(e)}",
+            "message": f"处理失败: {str(e)}",
             "download_url": ""
         }
