@@ -1,23 +1,17 @@
 {
-  "version": 2,
-  "builds": [
-    {
-      "src": "api/upload.py",
-      "use": "@vercel/python"
-    }
-  ],
-  "routes": [
-    {
-      "src": "/(.*)",
-      "dest": "/api/upload.py"
-    }
-  ],
   "functions": {
     "api/upload.py": {
       "maxDuration": 60
     }
   },
-  "env": {
-    "PYTHONPATH": "/var/task"
-  }
+  "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": "/api/upload.py"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/api/upload.py"
+    }
+  ]
 }
